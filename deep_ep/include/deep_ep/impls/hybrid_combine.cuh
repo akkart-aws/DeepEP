@@ -71,10 +71,12 @@ hybrid_combine_impl(nv_bfloat16* x,
         token_layout, kNumTokensInScaleupLayout, kNumScaleoutRanks * kNumMaxTokensPerRank,
         buffer);
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
-        token_layout, kNumTokensInScaleoutLayout, kNumMaxTokensPerRank,
+        token_layout, kNumScaleoutRanks,
+        kNumChannels * (kNumMaxTokensPerChannel * (kAllowMultipleReduction ? 1 : kNumTopk)),
         scaleup_buffer.get_buffer_end_ptr());
     auto scaleout_send_buffer = layout::BufferLayout<false>(
-        token_layout, kAllowMultipleReduction ? 1 : kNumTopk, kNumChannels * (kNumScaleoutRanks * kNumMaxTokensPerChannel),
+        token_layout, kNumScaleoutRanks,
+        kNumChannels * (kNumMaxTokensPerChannel * (kAllowMultipleReduction ? 1 : kNumTopk)),
         scaleout_recv_buffer.get_buffer_end_ptr());
 
     // Init TMA for scale-up and forward warps
@@ -350,8 +352,11 @@ hybrid_combine_impl(nv_bfloat16* x,
         if constexpr (kAdjustRegisters)
             ptx::warpgroup_reg_alloc<kNumRegistersForForwardWarps>();
 
-        // Shift into the right buffer
-        scaleout_send_buffer = scaleout_send_buffer.get_channel_buffer<kNumScaleoutRanks * kNumMaxTokensPerChannel>(channel_idx);
+        constexpr int kNumSlotsPerChannel = kNumMaxTokensPerChannel * (kAllowMultipleReduction ? 1 : kNumTopk);
+        scaleout_send_buffer = scaleout_send_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+        scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+
+        int slot_of_per_channel[kNumScaleoutRanks] = {};
 
         // Shape of `token_metadata_at_forward`: `[kNumChannels, kNumScaleoutRanks * kNumMaxTokensPerChannel + 1, kNumForwardMetadataDims]`
         constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
@@ -451,7 +456,9 @@ hybrid_combine_impl(nv_bfloat16* x,
                 auto topk_valid_mask = kUseExpandedLayout ?
                     ptx::gather(stored_src_scaleup_rank_idx >= 0) :
                     ptx::gather(ptx::deduplicate(stored_src_scaleup_rank_idx, lane_idx) and stored_src_scaleup_rank_idx >= 0);  // Deduplicate w.r.t. scaleup rank index if expanded mode is disabled
+                const int num_valid_topk = __popc(topk_valid_mask);
                 if (ptx::elect_one_sync()) {
+                    int packed_offset_in_entry = 0;
                     #pragma unroll
                     for (int k = 0; k < kNumTopk; ++ k) {
                         if ((topk_valid_mask & (1u << k)) == 0u)
@@ -465,9 +472,17 @@ hybrid_combine_impl(nv_bfloat16* x,
                         ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
 
                         // Issue TMA store, and wait
-                        const auto recv_buffer_ptr = scaleout_recv_buffer.get_rank_buffer(k).get_token_buffer(src_token_idx).get_base_ptr();
+                        const auto recv_buffer_ptr = scaleout_recv_buffer
+                            .get_rank_buffer(scaleout_rank_idx)
+                            .get_token_buffer(slot_of_per_channel[src_scaleout_rank_idx] + packed_offset_in_entry)
+                            .get_base_ptr();
                         const auto send_buffer_ptr = src_scaleout_rank_idx == scaleout_rank_idx ?
-                            recv_buffer_ptr : scaleout_send_buffer.get_rank_buffer(k).get_token_buffer(i).get_base_ptr();
+                            recv_buffer_ptr :
+                            scaleout_send_buffer
+                                .get_rank_buffer(src_scaleout_rank_idx)
+                                .get_token_buffer(slot_of_per_channel[src_scaleout_rank_idx] + packed_offset_in_entry)
+                                .get_base_ptr();
+                        ++ packed_offset_in_entry;
                         ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), token_layout.get_num_bytes<false>());
                         ptx::tma_store_commit();
                         ptx::tma_store_wait();
@@ -486,6 +501,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                     }
                 }
                 __syncwarp();
+                slot_of_per_channel[src_scaleout_rank_idx] += num_valid_topk;
             } else {
                 // NOTES: we must do deduplicate and only add once from one rank
                 auto reduce_valid_mask = ptx::gather(
@@ -537,17 +553,16 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                 // Assign send and receive buffers
                 // NOTES: as we only have 1 destination, we will use "send" as "recv" for local transfer
-                int scaleout_recv_buffer_rank_idx;
-                if constexpr (kUseScaleoutRankLayout) {
-                    scaleout_recv_buffer_rank_idx = scaleout_rank_idx;
-                } else {
-                    const int src_topk_idx = ptx::get_master_lane_idx(ptx::gather(stored_src_scaleup_rank_idx >= 0));
-                    scaleout_recv_buffer_rank_idx = src_topk_idx;
-                }
-                const auto recv_token_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_recv_buffer_rank_idx).get_token_buffer(src_token_idx);
+                const int recv_slot = slot_of_per_channel[src_scaleout_rank_idx];
+                const auto recv_token_buffer = scaleout_recv_buffer
+                    .get_rank_buffer(scaleout_rank_idx)
+                    .get_token_buffer(recv_slot);
                 const auto send_token_buffer = src_scaleout_rank_idx == scaleout_rank_idx ?
                     recv_token_buffer :
-                    scaleout_send_buffer.get_token_buffer(i);
+                    scaleout_send_buffer
+                    .get_rank_buffer(src_scaleout_rank_idx)
+                    .get_token_buffer(slot_of_per_channel[src_scaleout_rank_idx]);
+                slot_of_per_channel[src_scaleout_rank_idx] += 1;
 
                 // Write into scale-out send buffer or local rank recv buffer bypass
                 if (ptx::elect_one_sync()) {

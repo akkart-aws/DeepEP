@@ -201,6 +201,7 @@ public:
         int hidden;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
+        int num_channels;
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -209,6 +210,7 @@ public:
         void* reduce_buffer;
         void* bias_0;
         void* bias_1;
+        int* token_map_at_dispatch;
         int num_combined_tokens;
         int scaleout_rank_idx, scaleup_rank_idx;
 
@@ -222,7 +224,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
@@ -230,7 +232,8 @@ static void __instantiate_kernel() {{
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.hidden,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk);
+                           args.num_experts, args.num_topk,
+                           args.num_channels);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -240,6 +243,7 @@ static void __instantiate_kernel() {{
                                                  args.combined_topk_idx,
                                                  args.reduce_buffer,
                                                  args.bias_0, args.bias_1,
+                                                 args.token_map_at_dispatch,
                                                  args.num_combined_tokens,
                                                  args.scaleout_rank_idx, args.scaleup_rank_idx));
     }
@@ -251,8 +255,10 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_combined_tokens, const int& num_max_tokens_per_rank,
                                            const int& hidden,
                                            const int& num_experts, const int& num_topk,
+                                           const int& num_channels,
                                            void* reduce_buffer,
                                            void* bias_0, void* bias_1,
+                                           int* token_map_at_dispatch,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
@@ -272,11 +278,13 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
+        .num_channels = num_channels,
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,
         .reduce_buffer = reduce_buffer,
         .bias_0 = bias_0, .bias_1 = bias_1,
+        .token_map_at_dispatch = token_map_at_dispatch,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)

@@ -6,12 +6,14 @@
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
+#include <deep_ep/impls/combine_utils.cuh>
 
 
 namespace deep_ep::elastic {
 
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kAllowMultipleReduction,
           int kNumSMs,
           int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -39,6 +41,7 @@ hybrid_dispatch_impl(
     int* psum_num_recv_tokens_per_expert,
     int* dst_buffer_slot_idx,
     int* token_metadata_at_forward,
+    int* token_map_at_dispatch,
     const int num_tokens,
     const int sf_token_stride, const int sf_hidden_stride,
     // TODO(NCCL): so many params, plans to optimize?
@@ -330,6 +333,7 @@ hybrid_dispatch_impl(
         // Channel metadata maintenance
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
         int stored_scaleout_tail = 0, stored_old_scaleout_tail = 0;
+        int stored_combine_slot_tail = 0;
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx < kNumScaleoutRanks and
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kScaleoutUpdateInterval or finish_flag)) {
@@ -413,6 +417,70 @@ hybrid_dispatch_impl(
             // Update scale-out tail
             const auto scaleout_rank_mask = ptx::reduce_or(stored_dst_scaleout_rank_idx >= 0 ? (1u << stored_dst_scaleout_rank_idx) : 0u);
             stored_scaleout_tail += (scaleout_rank_mask >> lane_idx) & 1;
+
+            // Build the map that combine will use to gather partials back.
+            //
+            // Terminology:
+            //   T          — token index (per-rank, this rank's PyTorch tensor slot)
+            //   k          — top-k slot within a token
+            //   G          — global rank id (0 .. ScaleoutRank × ScaleupRank - 1)
+            //   scaleout   — G / ScaleupRank, i.e. which node this global rank sits on
+            //
+            // Setup: T=0, channel=7, topK=4, ScaleoutRank=8, ScaleUpRank=8 (64 global ranks total).
+            //   Routing: (k=0 → G=9 → scaleout=1),
+            //            (k=1 → G=2 → scaleout=0),
+            //            (k=2 → G=5 → scaleout=0),   ← same scaleout as k=1
+            //            (k=3 → G=20 → scaleout=2).
+            //
+            // Each map entry is a `pack(scaleout_rank, slot, channel)` tuple naming the recv slot
+            // where combine will place this k's return partial on my `scaleout_recv_buffer`.
+            //
+            // Reduce mode: k's targeting the same scaleout rank share one recv slot (combine
+            // reduces their partials into one before RDMA):
+            //   map[0][0..3] = [ pack(1,0,7), pack(0,0,7), pack(0,0,7), pack(2,0,7) ]
+            //                                              ^ k=2 shares k=1's slot on scaleout=0
+            //
+            // Expand mode: each valid k gets its own slot within its scaleout rank's group,
+            // packed contiguously:
+            //   map[0][0..3] = [ pack(1,0,7), pack(0,0,7), pack(0,1,7), pack(2,0,7) ]
+            //                                              ^ k=2 lands at slot=1 next to k=1's slot=0
+            if constexpr (not kReuseSlotIndices) {
+                int combine_slot;
+
+                const int combine_slot_base = ptx::exchange(
+                    stored_combine_slot_tail,
+                    stored_dst_scaleout_rank_idx >= 0 ? stored_dst_scaleout_rank_idx : 0);
+
+                // If reduction enabled, then each token consume signle slot per scaleout rank.
+                if constexpr (kAllowMultipleReduction) {
+                    combine_slot = combine_slot_base;
+                } else {
+                    // If reduction disabled, then each token will be routed back up to topK times.
+                    const uint32_t same_rank_mask = ptx::match(stored_dst_scaleout_rank_idx);
+                    const uint32_t below_mask = same_rank_mask & ((1u << lane_idx) - 1u);
+                    combine_slot = combine_slot_base + __popc(below_mask);
+                }
+
+                if (lane_idx < kNumTopk) {
+                    const int packed = stored_dst_scaleout_rank_idx >= 0
+                        ? pack_combine_recv_addr(stored_dst_scaleout_rank_idx, combine_slot, channel_idx)
+                        : -1;
+                    token_map_at_dispatch[token_idx * kNumTopk + lane_idx] = packed;
+                }
+                __syncwarp();
+
+                if constexpr (kAllowMultipleReduction) {
+                    stored_combine_slot_tail += (scaleout_rank_mask >> lane_idx) & 1;
+                } else {
+                    int my_targeted_count = 0;
+                    #pragma unroll
+                    for (int k = 0; k < kNumTopk; ++ k) {
+                        const int R_k = __shfl_sync(0xffffffff, stored_dst_scaleout_rank_idx, k);
+                        my_targeted_count += (R_k == lane_idx and R_k >= 0) ? 1 : 0;
+                    }
+                    stored_combine_slot_tail += my_targeted_count;
+                }
+            }
 
             // Wait TMA arrival and issue the TMA store into send buffer
             if (ptx::elect_one_sync()) {

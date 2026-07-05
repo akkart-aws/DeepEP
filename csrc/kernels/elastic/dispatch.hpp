@@ -94,6 +94,9 @@ public:
         bool is_scaleup_nvlink;
         bool do_cpu_sync;
         bool reuse_slot_indices;
+        // Combine-time reduction mode. Only used by the hybrid kernel to decide how to encode
+        // per-(token, k) slot offsets in `token_map_at_dispatch`. Ignored by the direct kernel.
+        bool allow_multiple_reduction;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
@@ -112,6 +115,7 @@ public:
         int* psum_num_recv_tokens_per_expert;
         int* dst_buffer_slot_idx;
         int* token_metadata_at_forward;
+        int* token_map_at_dispatch;
         int num_tokens;
         int sf_token_stride, sf_hidden_stride;
         ncclDevComm_t nccl_dev_comm;
@@ -140,9 +144,10 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch";
-            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
+                args.allow_multiple_reduction,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
                 args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -189,6 +194,7 @@ static void __instantiate_kernel() {{
                 args.psum_num_recv_tokens_per_expert,
                 args.dst_buffer_slot_idx,
                 args.token_metadata_at_forward,
+                args.token_map_at_dispatch,
                 args.num_tokens,
                 args.sf_token_stride, args.sf_hidden_stride,
                 args.nccl_dev_comm, args.nccl_window,
@@ -219,6 +225,7 @@ static void launch_dispatch(void* x, void* sf,
                             int* psum_num_recv_tokens_per_expert,
                             int* dst_buffer_slot_idx,
                             int* token_metadata_at_forward,
+                            int* token_map_at_dispatch,
                             const int& num_tokens, const int& num_max_tokens_per_rank,
                             const int& hidden, const int& elem_size,
                             const int& num_sf_packs, const int& sf_token_stride, const int& sf_hidden_stride,
@@ -235,6 +242,9 @@ static void launch_dispatch(void* x, void* sf,
                             const bool& cached_mode,
                             const bool& deterministic,
                             const bool& do_cpu_sync,
+                            // Combine-time reduction mode. Only affects the hybrid kernel's
+                            // `token_map_at_dispatch` slot encoding; direct dispatch ignores it.
+                            const bool& allow_multiple_reduction,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -278,6 +288,7 @@ static void launch_dispatch(void* x, void* sf,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
+        .allow_multiple_reduction = allow_multiple_reduction,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
@@ -293,6 +304,7 @@ static void launch_dispatch(void* x, void* sf,
         .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
         .dst_buffer_slot_idx = dst_buffer_slot_idx,
         .token_metadata_at_forward = token_metadata_at_forward,
+        .token_map_at_dispatch = token_map_at_dispatch,
         .num_tokens = num_tokens,
         .sf_token_stride = sf_token_stride, .sf_hidden_stride = sf_hidden_stride,
         .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
