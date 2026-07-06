@@ -4,6 +4,8 @@
 #include <vector>
 #include <optional>
 
+#include <deep_ep/common/gin_resource_alloc.cuh>
+
 #include <nccl.h>
 #include <nccl_device.h>
 
@@ -72,6 +74,8 @@ public:
 
     // Configs
     int num_allocated_qps;
+    int num_max_sms;
+    elastic::gin_alloc::GinResourceConfig gin_config;
 
     // Buffer size
     int64_t num_gpu_bytes;
@@ -81,7 +85,8 @@ public:
                                const int& num_ranks, const int& rank_idx,
                                const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                const bool& allow_hybrid_mode,
-                               const int& sl_idx, const int& num_allocated_qps);
+                               const int& sl_idx, const int& num_allocated_qps,
+                               const int& num_max_sms);
 
     // TODO: finish this with `explicit_destroy`
     // ~NCCLSymmetricMemoryContext();

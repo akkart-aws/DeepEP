@@ -63,8 +63,9 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
                                                        const int& num_ranks, const int& rank_idx,
                                                        const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                                        const bool& allow_hybrid_mode,
-                                                       const int& sl_idx, const int& num_allocated_qps):
-    rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps) {
+                                                       const int& sl_idx, const int& num_allocated_qps,
+                                                       const int& num_max_sms):
+    rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps), num_max_sms(num_max_sms) {
     if (get_env("EP_BUFFER_DEBUG", 0)) {
         int nccl_version;
         NCCL_CHECK(ncclGetVersion(&nccl_version));
@@ -93,13 +94,57 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     // Initialize NCCL device communicator
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     if (num_ranks > 1 and not gin_disabled) {
-        reqs.ginContextCount = num_allocated_qps;
-        reqs.ginExclusiveContexts = true;
+        const int num_nvl_ranks_early = ncclTeamLsa(comm).nRanks;
+        EP_HOST_ASSERT(num_ranks % num_nvl_ranks_early == 0);
+        const int num_rdma_ranks = num_ranks / num_nvl_ranks_early;
+        // Cap down the number of SMs, as we are limited in resources. The ctor
+        // parameter `num_max_sms` is a const reference, but the member
+        // `this->num_max_sms` (initialized from it) is mutable, so we override
+        // the member — same pattern as `num_allocated_qps` below.
+        if (this->num_max_sms > elastic::gin_alloc::kMaxSM) {
+            printf("DeepEP WARNING: requested num_max_sms=%d exceeds the GIN resource "
+                   "limit (kMaxSM=%d); overriding to %d\n",
+                   this->num_max_sms, elastic::gin_alloc::kMaxSM, elastic::gin_alloc::kMaxSM);
+            this->num_max_sms = elastic::gin_alloc::kMaxSM;
+        }
+
+        const int scaleout_warp_cap = (this->num_max_sms > 0)
+            ? (this->num_max_sms * elastic::gin_alloc::kMaxWarpsPerSM)
+
+            : elastic::gin_alloc::kMaxScaleoutWarps;
+        gin_config = elastic::gin_alloc::compute_gin_resources(scaleout_warp_cap);
+
+        // Auto-tuner sanity checks, each peer rail team (not including self) must have dedicated signals
+        EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1));
+
+        // If the user did not set --num-qp (=0), default to the auto-tuner's context
+        // budget. Otherwise it must fit within it; if it exceeds the budget we
+        // override it down to the budget and warn instead of asserting.
+        if (this->num_allocated_qps == 0) {
+            this->num_allocated_qps = gin_config.gin_context_cnt;
+        } else if (this->num_allocated_qps > gin_config.gin_context_cnt) {
+            printf("DeepEP WARNING: requested num_allocated_qps=%d exceeds the GIN context "
+                   "budget (%d); overriding to %d\n",
+                   this->num_allocated_qps, gin_config.gin_context_cnt, gin_config.gin_context_cnt);
+            this->num_allocated_qps = gin_config.gin_context_cnt;
+        }
+
+        printf("GIN auto-tuner: gin_context_cnt=%d, gin_indexed_signals_cnt=%d, num_qp=%d, num_max_sms=%d\n",
+               gin_config.gin_context_cnt,
+               gin_config.gin_indexed_signals_cnt,
+               this->num_allocated_qps,
+               this->num_max_sms);
+
+        reqs.ginExclusiveContexts = false;
         reqs.ginQueueDepth = 1024;
         reqs.ginTrafficClass = sl_idx;
-        // Customized RDMA barrier needs extra signals
-        reqs.ginSignalCount = num_ranks + 2 * 2;
+        reqs.ginContextCount = gin_config.gin_context_cnt;
+        reqs.ginSignalCount = gin_config.gin_indexed_signals_cnt;
+
         reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
+        // VA signals are not supported by EFA GDA, in addition EFA GDA does not support strong signals.
+        reqs.ginVaSignalsRequired = false;
+        reqs.ginStrongSignalsRequired = false;
     }
     NCCL_CHECK(ncclDevCommCreate(comm, &reqs, &dev_comm));
 

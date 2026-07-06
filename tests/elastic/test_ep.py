@@ -63,6 +63,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
     num_topk, num_experts = args.num_topk, args.num_experts
     num_local_experts = num_experts // buffer.num_ranks
     num_sms = buffer.get_theoretical_num_sms(num_experts, num_topk) if args.num_sms == 0 else args.num_sms
+    # Respect the GIN-resource-clamped SM cap resolved by the C++ constructor.
+    if buffer.num_max_sms > 0:
+        num_sms = min(num_sms, buffer.num_max_sms)
     num_qps = buffer.get_theoretical_num_qps(num_sms) if args.num_qps == 0 else args.num_qps
     dist_print(f'Config:\n'
                f' > Ranks: {num_scaleout_ranks} x {num_scaleup_ranks}\n'
@@ -483,6 +486,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                      prefer_overlap_with_compute=bool(args.prefer_overlap_with_compute),
                                      sl_idx=args.sl_idx,
                                      num_allocated_qps=max(args.num_allocated_qps, args.num_qps),
+                                     num_max_sms=args.num_sms,
                                      explicitly_destroy=True,
                                      num_gpu_timeout_secs=args.num_gpu_timeout_secs,
                                      num_cpu_timeout_secs=args.num_cpu_timeout_secs)

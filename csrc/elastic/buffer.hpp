@@ -87,6 +87,7 @@ public:
                   const bool& allow_multiple_reduction,
                   const bool& prefer_overlap_with_compute,
                   const int& sl_idx, const int& num_allocated_qps,
+                  const int& num_max_sms,
                   const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                   const bool& explicitly_destroy):
         num_buffer_bytes(num_buffer_bytes),
@@ -114,7 +115,7 @@ public:
         this->nccl_context = std::make_shared<nccl::NCCLSymmetricMemoryContext>(
             nccl_comm, cpu_comm, num_ranks, rank_idx,
             num_sym_bytes, num_cpu_buffer_bytes,
-            allow_hybrid_mode, sl_idx, num_allocated_qps);
+            allow_hybrid_mode, sl_idx, num_allocated_qps, num_max_sms);
 
         // Verify the symmetric memory layout matches our expectations
         EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes == nccl_context->num_gpu_bytes);
@@ -174,6 +175,14 @@ public:
 
     std::tuple<int, int> get_physical_domain_size() const {
         return {nccl_context->num_rdma_ranks, nccl_context->num_nvl_ranks};
+    }
+
+    int get_num_allocated_qps() const {
+        return nccl_context->num_allocated_qps;
+    }
+
+    int get_num_max_sms() const {
+        return nccl_context->num_max_sms;
     }
 
     std::tuple<int, int> get_logical_domain_size() const {
@@ -682,7 +691,7 @@ public:
              const std::optional<torch::Tensor>& cached_token_map_at_dispatch,
              const int& num_max_tokens_per_rank,
              const int& num_experts, const int& expert_alignment,
-             const int& num_sms, const int& num_qps,
+             const int& num_sms_requested, const int& num_qps,
              const std::optional<EventHandle>& previous_event,
              const std::optional<EventHandle>& previous_event_before_epilogue,
              const bool& async_with_compute_stream,
@@ -690,7 +699,13 @@ public:
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
              const bool& use_tma_aligned_col_major_sf) const {
         // Check SM count
-        EP_HOST_ASSERT(num_sms > 0);
+        EP_HOST_ASSERT(num_sms_requested > 0);
+        // Clamp num_sms to the GIN-resource cap resolved at construction, so
+        // that num_channels = num_sms * num_channels_per_sm stays within the
+        // signal budget the auto-tuner allocated.
+        const int num_sms = (nccl_context->num_max_sms > 0)
+            ? std::min(num_sms_requested, nccl_context->num_max_sms)
+            : num_sms_requested;
 
         // Cached mode must have responding handles
         const bool cached_mode = cached_num_recv_tokens.has_value();
@@ -1176,14 +1191,18 @@ public:
             const std::optional<torch::Tensor>& token_map_at_dispatch,
             const int& num_experts,
             const int& num_max_tokens_per_rank,
-            const int& num_sms, const int& num_qps,
+            const int& num_sms_requested, const int& num_qps,
             const std::optional<EventHandle>& previous_event,
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
             const bool& use_expanded_layout) const {
         // Check SM count
-        EP_HOST_ASSERT(num_sms > 0);
+        EP_HOST_ASSERT(num_sms_requested > 0);
+        // Clamp to the GIN-resource cap — see rationale in dispatch().
+        const int num_sms = (nccl_context->num_max_sms > 0)
+            ? std::min(num_sms_requested, nccl_context->num_max_sms)
+            : num_sms_requested;
 
         // Check data
         const auto [num_tokens, hidden] = get_shape<2>(x);
@@ -1345,10 +1364,12 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
-        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, bool, int, int, int, int, bool>())
+        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, bool, int, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
+        .def("get_num_allocated_qps", &ElasticBuffer::get_num_allocated_qps)
+        .def("get_num_max_sms", &ElasticBuffer::get_num_max_sms)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
         .def("barrier", &ElasticBuffer::barrier)
         .def("engram_write", &ElasticBuffer::engram_write)

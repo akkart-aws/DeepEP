@@ -14,7 +14,6 @@ from ..utils.event import EventOverlap
 from ..utils.math import ceil_div, align
 from ..utils.semantic import value_or, weak_lru
 from ..utils.envs import (
-    check_fast_rdma_atomic_support,
     check_nvlink_connections, check_torch_deterministic,
     get_nvlink_gbs, get_rdma_gbs
 )
@@ -142,6 +141,7 @@ class ElasticBuffer:
                  prefer_overlap_with_compute: bool = True,
                  sl_idx: int = 3,
                  num_allocated_qps: int = 0,
+                 num_max_sms: int = 0,
                  num_cpu_timeout_secs: int = 300, num_gpu_timeout_secs: int = 100,
                  explicitly_destroy: bool = False):
         """
@@ -162,6 +162,8 @@ class ElasticBuffer:
             prefer_overlap_with_compute: whether to prefer overlapping communication with compute.
             sl_idx: the RDMA service level index, can be overridden by `EP_OVERRIDE_RDMA_SL` env var.
             num_allocated_qps: the number of QPs to allocate for RDMA (0 for automatic).
+            num_max_sms: upper bound on SMs used by any dispatch/combine call. Sizes the
+                GIN context/signal auto-tuner (0 uses the design cap of 64 SMs).
             num_cpu_timeout_secs: CPU-side timeout in seconds for CPU sync.
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
@@ -199,17 +201,6 @@ class ElasticBuffer:
         if 'EP_OVERRIDE_RDMA_SL' in os.environ:
             sl_idx = int(os.environ['EP_OVERRIDE_RDMA_SL'])
 
-        # Automatic maximum QP count allowed
-        # TODO(tianr22): revise the QP count in consideration of Engram
-        if num_allocated_qps == 0:
-            # Hybrid mode will consume more QPs
-            # The extra QP is for notify warps
-            if self.allow_hybrid_mode:
-                num_allocated_qps = 65 if check_fast_rdma_atomic_support() else 129
-            else:
-                num_allocated_qps = 17
-        self.num_allocated_qps = num_allocated_qps
-
         # Create CPU communicator (exchange POSIX FD handles for CPU segments)
         cpu_comm = []
         if allow_hybrid_mode and num_cpu_bytes > 0:
@@ -227,8 +218,16 @@ class ElasticBuffer:
                                         allow_multiple_reduction,
                                         prefer_overlap_with_compute,
                                         sl_idx, num_allocated_qps,
+                                        num_max_sms,
                                         num_cpu_timeout_secs, num_gpu_timeout_secs,
                                         self.explicitly_destroy)
+
+        # Read back the resolved QP count (may be defaulted by the C++ auto-tuner).
+        self.num_allocated_qps = self.runtime.get_num_allocated_qps()
+
+        # Read back the resolved SM cap (may be clamped down to `kMaxSM` by the C++
+        # side due to GIN resource limits). 0 means "no explicit cap".
+        self.num_max_sms = self.runtime.get_num_max_sms()
 
         # Logical rank indices
         self.num_scaleout_ranks, self.num_scaleup_ranks = self.get_logical_domain_size()
@@ -782,6 +781,10 @@ class ElasticBuffer:
         # Automatic decide SM and QP count
         num_topk = (handle.topk_idx if topk_idx is None else topk_idx).shape[1]
         num_sms = self.get_theoretical_num_sms(num_experts, num_topk) if num_sms == 0 else num_sms
+        # Clamp against the resolved SM cap so we never launch with more SMs than the
+        # GIN auto-tuner budget provisioned for.
+        if self.num_max_sms > 0:
+            num_sms = min(num_sms, self.num_max_sms)
         num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 
@@ -916,6 +919,10 @@ class ElasticBuffer:
 
         # Automatic decide SM and QP count
         num_sms = handle.num_sms if num_sms == 0 else num_sms
+        # Clamp against the resolved SM cap (handles the case where the caller passes
+        # an explicit num_sms; the handle's value is already clamped from dispatch).
+        if self.num_max_sms > 0:
+            num_sms = min(num_sms, self.num_max_sms)
         num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 

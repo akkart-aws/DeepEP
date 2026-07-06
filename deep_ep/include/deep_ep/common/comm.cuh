@@ -154,11 +154,22 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
         const auto team = (std::is_same_v<team_t, ncclTeamTagWorld>) ?
             ncclTeamWorld(nccl_dev_comm) : ncclTeamRail(nccl_dev_comm);
         const ncclGin gin(nccl_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
-        for (int i = thread_idx; i < kNumRanks; i += kNumThreads)
-            gin.signal(team, i, ncclGin_SignalInc{static_cast<ncclGinSignal_t>(rank_idx)});
+
+        // Compact signal indexing: (kNumRanks - 1) signal slots per rank. Sender rank_idx
+        // writes to every peer i at the slot that identifies *itself* in the peer's
+        // enumeration:
+        //   sig = (rank_idx < i) ? rank_idx : (rank_idx - 1)
+        // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
+        // distinct sender, and the wait side just iterates all slots looking for one
+        // increment per slot.
+        for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+            if (i == rank_idx) continue;
+            const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
+            gin.signal(team, i, ncclGin_SignalInc{sig});
+        }
 
         // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
-        for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
+        for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
             const auto signal_idx = static_cast<ncclGinSignal_t>(i);
             const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
             const auto target = ++(*shadow_ptr);
