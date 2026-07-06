@@ -18,6 +18,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
+          int kBatchSize = 10,
           int kNumChannelsPerSM = kNumForwardWarps,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
@@ -36,10 +37,11 @@ hybrid_combine_impl(nv_bfloat16* x,
                     int* psum_num_recv_tokens_per_scaleup_rank,
                     int* token_metadata_at_forward,
                     int* channel_linked_list,
+                    const int* token_map_at_dispatch,
                     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
-                    int num_reduced_tokens) {
+                    int num_reduced_tokens, const int num_combined_tokens) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -362,25 +364,56 @@ hybrid_combine_impl(nv_bfloat16* x,
         constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
         token_metadata_at_forward += channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
 
-        // Overlap TMA stores and reduction
+        // Per Channel/ScaleOutRank batch metadata
+        int batch_count[kNumScaleoutRanks] = {};
+        int batch_start_slot[kNumScaleoutRanks];
+
+        const auto issue_batched_rdma = [&](const int& dst) {
+            if (batch_count[dst] == 0)
+                return;
+            const auto send_ptr = scaleout_send_buffer
+                .get_rank_buffer(dst)
+                .get_token_buffer(batch_start_slot[dst])
+                .get_base_ptr();
+            const auto recv_ptr = scaleout_recv_buffer
+                .get_rank_buffer(scaleout_rank_idx)
+                .get_token_buffer(batch_start_slot[dst])
+                .get_base_ptr();
+            // Uses a VA signal as an accumulator on `signaled_tail[channel][0]`, shared
+            // across all scale-out senders on this channel. `signaled_tail[:][0]` acts as
+            // the budget for the indexed signal that will replace this in the future.
+            const auto signal_sym_ptr = workspace_layout
+                .get_scaleout_channel_signaled_tail_ptr(channel_idx, 0);
+            gin.put<ncclTeamTagRail>(
+                recv_ptr, send_ptr,
+                batch_count[dst] * token_layout.get_num_bytes<false>(),
+                dst,
+                0, /*flags=0*/
+                ncclGin_VASignalAdd(nccl_window,
+                                    gin.get_sym_offset(signal_sym_ptr),
+                                    static_cast<uint64_t>(1))
+            );
+            batch_count[dst] = 0;
+        };
+
+        // Update per Channel/ScaleOutRank batch metadata and GIN PUT when threshold met
+        const auto record_slot_and_maybe_flush = [&](const int& dst, const int& slot) {
+            if (batch_count[dst] == 0)
+                batch_start_slot[dst] = slot;
+            batch_count[dst] += 1;
+            if (batch_count[dst] == kBatchSize)
+                issue_batched_rdma(dst);
+        };
+
         int last_src_scaleout_rank_idx = -1;
-        int last_is_token_last_in_chunk = 0;
-        void* last_recv_token_buffer_ptr = nullptr;
-        void* last_send_token_buffer_ptr = nullptr;
-        const auto flush_last_tma_and_issue_rdma = [&]() {
+        int last_slot_written = -1;
+        const auto flush_last_tma_and_record_batch = [&]() {
             if (last_src_scaleout_rank_idx >= 0 and ptx::elect_one_sync()) {
                 ptx::tma_store_wait();
 
-                // Issue only if not local rank
-                if (last_src_scaleout_rank_idx != scaleout_rank_idx) {
-                    gin.put<ncclTeamTagRail>(
-                        last_recv_token_buffer_ptr,
-                        last_send_token_buffer_ptr,
-                        token_layout.get_num_bytes<false>(),
-                        last_src_scaleout_rank_idx,
-                        last_is_token_last_in_chunk ? 0 : ncclGinOptFlagsAggregateRequests
-                    );
-                }
+                 // Issue only if not local rank
+                if (last_src_scaleout_rank_idx != scaleout_rank_idx)
+                    record_slot_and_maybe_flush(last_src_scaleout_rank_idx, last_slot_written);
             }
             __syncwarp();
         };
@@ -389,7 +422,6 @@ hybrid_combine_impl(nv_bfloat16* x,
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
         for (int i = 0; ; ++ i) {
             const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
-            const auto is_token_last_in_chunk = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 1);
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;
@@ -471,33 +503,25 @@ hybrid_combine_impl(nv_bfloat16* x,
                         ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, token_layout.get_num_bytes<false>());
                         ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
 
-                        // Issue TMA store, and wait
+                        const int slot = slot_of_per_channel[src_scaleout_rank_idx] + packed_offset_in_entry;
                         const auto recv_buffer_ptr = scaleout_recv_buffer
                             .get_rank_buffer(scaleout_rank_idx)
-                            .get_token_buffer(slot_of_per_channel[src_scaleout_rank_idx] + packed_offset_in_entry)
+                            .get_token_buffer(slot)
                             .get_base_ptr();
                         const auto send_buffer_ptr = src_scaleout_rank_idx == scaleout_rank_idx ?
                             recv_buffer_ptr :
                             scaleout_send_buffer
                                 .get_rank_buffer(src_scaleout_rank_idx)
-                                .get_token_buffer(slot_of_per_channel[src_scaleout_rank_idx] + packed_offset_in_entry)
+                                .get_token_buffer(slot)
                                 .get_base_ptr();
                         ++ packed_offset_in_entry;
                         ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), token_layout.get_num_bytes<false>());
                         ptx::tma_store_commit();
                         ptx::tma_store_wait();
 
-                        // Issue IBGDA
                         topk_valid_mask ^= 1u << k;
-                        if (src_scaleout_rank_idx != scaleout_rank_idx) {
-                            gin.put<ncclTeamTagRail>(
-                                recv_buffer_ptr,
-                                send_buffer_ptr,
-                                token_layout.get_num_bytes<false>(),
-                                src_scaleout_rank_idx,
-                                topk_valid_mask == 0 and is_token_last_in_chunk ? 0 : ncclGinOptFlagsAggregateRequests
-                            );
-                        }
+                        if (src_scaleout_rank_idx != scaleout_rank_idx)
+                            record_slot_and_maybe_flush(src_scaleout_rank_idx, slot);
                     }
                 }
                 __syncwarp();
@@ -535,7 +559,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                         return static_cast<combine_vec_t*>(scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr());
                     },
                     /* Wait buffer release */ [=]() {
-                        flush_last_tma_and_issue_rdma();
+                        flush_last_tma_and_record_batch();
                     }
                 );
 
@@ -574,15 +598,21 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                 // Record RDMA info to issue later
                 last_src_scaleout_rank_idx = src_scaleout_rank_idx;
-                last_is_token_last_in_chunk = is_token_last_in_chunk;
-                last_recv_token_buffer_ptr = recv_token_buffer.get_base_ptr();
-                last_send_token_buffer_ptr = send_token_buffer.get_base_ptr();
+                last_slot_written = recv_slot;
             }
         }
 
-        // Issue the last RDMA
+        // Issue the last TMA and record operation for last RDMA
         if constexpr (kAllowMultipleReduction)
-            flush_last_tma_and_issue_rdma();
+            flush_last_tma_and_record_batch();
+
+        // Issue the last RDMA per channel/scaleout-warp
+        if (ptx::elect_one_sync()) {
+            #pragma unroll
+            for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
+                issue_batched_rdma(dst);
+        }
+        __syncwarp();
 
         // Clean scaleup tails
         #pragma unroll
@@ -595,22 +625,83 @@ hybrid_combine_impl(nv_bfloat16* x,
 
         // Update, wait and clean
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
-        const auto expected_signal = math::pack2<int, int64_t>(1, 0);
-        gin.flush<ncclCoopWarp>();
-        if (lane_idx < kNumScaleoutRanks) {
-            // Update remote tails
-            gin.red_add_rel<ncclTeamTagRail>(
-                workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx),
-                expected_signal, lane_idx);
+
+        // Derive the expected inbound put count for this channel by counting my own
+        // outbound routing decisions during dispatch. Count "distinct valid non-local packed
+        // entries per T" — same rule works for reduce and expand modes because of how
+        // dispatch fills the map.
+        //
+        // Concrete example — token T=0 on channel C, topK=4, my scaleout_rank_idx=3,
+        // routing (k=0 → scaleout 1, k=1 → scaleout 0, k=2 → scaleout 0, k=3 → scaleout 3):
+        //
+        //   Reduce mode (map = [ pack(1,0,C), pack(0,0,C), pack(0,0,C), pack(3,0,C) ]):
+        //     k=0: valid, rank=1 (remote), first sight of pack(1,0,C)         → count
+        //     k=1: valid, rank=0 (remote), first sight of pack(0,0,C)         → count
+        //     k=2: valid, rank=0 (remote), pack(0,0,C) already seen (dup)     → skip
+        //     k=3: valid, rank=3 (== self, local-bypass, no put fires)        → skip
+        //   Expected puts for T=0 = 2. Peer R=0 sends one reduced partial covering k=1+k=2.
+        //
+        //   Expand mode (map = [ pack(1,0,C), pack(0,0,C), pack(0,1,C), pack(3,0,C) ]):
+        //     k=0: valid, rank=1 (remote), unique packed value  → count
+        //     k=1: valid, rank=0 (remote), unique packed value  → count
+        //     k=2: valid, rank=0 (remote), unique packed value  → count
+        //     k=3: valid, rank=3 (self)                          → skip
+        //   Expected puts for T=0 = 3. Peer R=0 sends two separate partials (k=1, k=2)
+        //   at distinct slots because each valid k has its own packed slot in expand mode.
+        int local_expected_count_per_rank[kNumScaleoutRanks] = {};
+        {
+            #pragma unroll
+            for (int t_in_channel = lane_idx; t_in_channel < kNumMaxTokensPerChannel; t_in_channel += 32) {
+                const int token_idx = channel_idx + t_in_channel * kNumChannels;
+                if (token_idx >= num_combined_tokens)
+                    continue;
+                // Load this token's map entries once, then dedup+count within the topK block.
+                int packed_entries[kNumTopk];
+                #pragma unroll
+                for (int k = 0; k < kNumTopk; ++ k)
+                    packed_entries[k] = __ldg(token_map_at_dispatch + token_idx * kNumTopk + k);
+                #pragma unroll
+                for (int k = 0; k < kNumTopk; ++ k) {
+                    const int p = packed_entries[k];
+                    if (p < 0)
+                        continue;
+                    int rank, slot, channel;
+                    unpack_combine_recv_addr(p, rank, slot, channel);
+                    // Sanity: token T dispatched by us with `T % kNumChannels == channel_idx`
+                    // must have its map entry's channel field equal to channel_idx.
+                    EP_DEVICE_ASSERT(channel == channel_idx);
+                    if (rank == scaleout_rank_idx)
+                        continue;   // local-bypass, no RDMA put
+                    bool is_duplicate = false;
+                    #pragma unroll
+                    for (int prior_k = 0; prior_k < k; ++ prior_k)
+                        is_duplicate |= (packed_entries[prior_k] == p);
+                    if (not is_duplicate)
+                        local_expected_count_per_rank[rank] += 1;
+                }
+            }
+        }
+
+        // Each lane in the Forward warp (= channel) accumulated the expected tokens per scale-out
+        // rank in its own slice of the map. All-reduce across lanes so every lane sees
+        // the full per-rank total. Then divide by the batch size, that's the aggregation
+        // granularity we expect on the wire.
+        int num_expected_arrivals = 0;
+        #pragma unroll
+        for (int r = 0; r < kNumScaleoutRanks; ++ r) {
+            const int rank_total = ptx::reduce_add(local_expected_count_per_rank[r]);
+            num_expected_arrivals += math::ceil_div(rank_total, kBatchSize);
         }
         __syncwarp();
 
-        // Wait tail arrival
-        if (lane_idx < kNumScaleoutRanks) {
-            const auto wait_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx);
+        // Wait for the accumulator on `signaled_tail[channel][0]` to reach the expected count.
+        // The signal accumulator is a single scalar shared by all senders on this channel, so
+        // only one lane polls; the wait is a warp-uniform "have we received everything?" check.
+        if (ptx::elect_one_sync()) {
+            const auto wait_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, 0);
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                 const auto signal = ptx::ld_acquire_sys<int64_t>(wait_ptr);
-                if (signal == expected_signal) {
+                if (signal == static_cast<int64_t>(num_expected_arrivals)) {
                     // Clean for next usages
                     *wait_ptr = 0;
                     return true;
@@ -618,10 +709,9 @@ hybrid_combine_impl(nv_bfloat16* x,
 
                 if (is_last_check) {
                     printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, scale-up: %d/%d, "
-                           "channel: %d, lane: %d, signal: %lld, expected: %lld\n",
+                           "channel: %d, signal: %lld, expected: %d\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
-                           channel_idx, lane_idx,
-                           signal, expected_signal);
+                           channel_idx, signal, num_expected_arrivals);
                 }
                 return false;
             });

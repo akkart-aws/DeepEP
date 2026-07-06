@@ -32,12 +32,14 @@ public:
         int* psum_num_recv_tokens_per_scaleup_rank;
         int* token_metadata_at_forward;
         int* channel_linked_list;
+        int* token_map_at_dispatch;
         ncclDevComm_t nccl_dev_comm;
         ncclWindow_t nccl_window;
         void* buffer;
         void* workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
+        int num_combined_tokens;
 
         jit::LaunchArgs launch_args;
     };
@@ -98,10 +100,12 @@ static void __instantiate_kernel() {{
                                                      args.psum_num_recv_tokens_per_scaleup_rank,
                                                      args.token_metadata_at_forward,
                                                      args.channel_linked_list,
+                                                     args.token_map_at_dispatch,
                                                      args.nccl_dev_comm, args.nccl_window,
                                                      args.buffer, args.workspace,
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
-                                                     args.num_reduced_tokens));
+                                                     args.num_reduced_tokens,
+                                                     args.num_combined_tokens));
         }
     }
 };
@@ -117,9 +121,11 @@ static void* launch_combine(void* x,
                             int* psum_num_recv_tokens_per_scaleup_rank,
                             int* token_metadata_at_forward,
                             int* channel_linked_list,
+                            int* token_map_at_dispatch,
                             const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
                             void* buffer, void* workspace,
-                            const int& num_reduced_tokens, const int& num_max_tokens_per_rank,
+                            const int& num_reduced_tokens, const int& num_combined_tokens,
+                            const int& num_max_tokens_per_rank,
                             const int& hidden,
                             const int& num_experts, const int& num_topk,
                             const int& num_qps, const int64_t& num_timeout_cycles,
@@ -166,10 +172,12 @@ static void* launch_combine(void* x,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .token_metadata_at_forward = token_metadata_at_forward,
         .channel_linked_list = channel_linked_list,
+        .token_map_at_dispatch = token_map_at_dispatch,
         .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
         .buffer = buffer, .workspace = workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
+        .num_combined_tokens = num_combined_tokens,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };
