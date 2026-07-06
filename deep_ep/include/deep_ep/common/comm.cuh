@@ -85,6 +85,33 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     }
 }
 
+// Companion to `get_qp_mode`: within a QP, gives a unique per-channel signal id
+// (position of this channel among all channels sharing the same QP). The mapping
+// follows the same three branches as `get_qp_mode`:
+//   kNumQPs == 1                : every channel on the single QP → id = global_channel_idx
+//   kNumSMs <= kNumAvailableQPs : each QP is used by exactly one SM; within that SM
+//                                 channels sharing the QP have the same
+//                                 `channel_in_sm_idx % num_qps_in_sm` and different
+//                                 `channel_in_sm_idx / num_qps_in_sm` → id = that quotient
+//   kNumSMs  > kNumAvailableQPs : QPs are shared grid-wide by `global_channel_idx % QPs`
+//                                 → id = global_channel_idx / QPs
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
+__device__ __forceinline__ int get_qp_signal_id(
+    const int& sm_idx, const int& channel_in_sm_idx) {
+    if constexpr (kNumQPs == 1)
+        return sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+
+    constexpr int kQPStartIdx = static_cast<int>(kWithNotifyWarps);
+    constexpr int kNumAvailableQPs = kNumQPs - kQPStartIdx;
+    if constexpr (kNumSMs <= kNumAvailableQPs) {
+        const int num_qps_in_sm = (kNumAvailableQPs / kNumSMs) + (sm_idx < (kNumAvailableQPs % kNumSMs));
+        return channel_in_sm_idx / num_qps_in_sm;
+    } else {
+        const auto global_channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+        return global_channel_idx / kNumAvailableQPs;
+    }
+}
+
 template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
 __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     const handle::NCCLGin& gin,

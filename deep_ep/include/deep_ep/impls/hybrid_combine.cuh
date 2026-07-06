@@ -350,6 +350,13 @@ hybrid_combine_impl(nv_bfloat16* x,
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
 
+        // Indexed-signal id owned by this channel within its GIN context. Uses the
+        // companion helper to `get_qp_mode` (called at kernel entry) so the id is
+        // unique among all channels sharing this warp's QP, regardless of which of
+        // `get_qp_mode`'s branches picked the mapping.
+        const auto signal_id = static_cast<ncclGinSignal_t>(
+            comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM>(sm_idx, forward_warp_idx));
+
         // Adjust registers
         if constexpr (kAdjustRegisters)
             ptx::warpgroup_reg_alloc<kNumRegistersForForwardWarps>();
@@ -379,19 +386,12 @@ hybrid_combine_impl(nv_bfloat16* x,
                 .get_rank_buffer(scaleout_rank_idx)
                 .get_token_buffer(batch_start_slot[dst])
                 .get_base_ptr();
-            // Uses a VA signal as an accumulator on `signaled_tail[channel][0]`, shared
-            // across all scale-out senders on this channel. `signaled_tail[:][0]` acts as
-            // the budget for the indexed signal that will replace this in the future.
-            const auto signal_sym_ptr = workspace_layout
-                .get_scaleout_channel_signaled_tail_ptr(channel_idx, 0);
             gin.put<ncclTeamTagRail>(
                 recv_ptr, send_ptr,
                 batch_count[dst] * token_layout.get_num_bytes<false>(),
                 dst,
                 0, /*flags=0*/
-                ncclGin_VASignalAdd(nccl_window,
-                                    gin.get_sym_offset(signal_sym_ptr),
-                                    static_cast<uint64_t>(1))
+                ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
             );
             batch_count[dst] = 0;
         };
@@ -693,25 +693,25 @@ hybrid_combine_impl(nv_bfloat16* x,
             num_expected_arrivals += math::ceil_div(rank_total, kBatchSize);
         }
         __syncwarp();
-
-        // Wait for the accumulator on `signaled_tail[channel][0]` to reach the expected count.
-        // The signal accumulator is a single scalar shared by all senders on this channel, so
-        // only one lane polls; the wait is a warp-uniform "have we received everything?" check.
+        // Wait for the per-channel indexed signal to accumulate `num_expected_arrivals`
+        // increments from the remote senders. Bump the shadow by the expected delta to
+        // get the target count, then poll the actual signal until it catches up. only
+        // one lane polls. We poll with a timeout (instead of the blocking
+        // `waitSignalMeetShadow`) so a stuck peer surfaces a diagnostic rather than
+        // hanging.
         if (ptx::elect_one_sync()) {
-            const auto wait_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, 0);
+            const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
+            const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = ptx::ld_acquire_sys<int64_t>(wait_ptr);
-                if (signal == static_cast<int64_t>(num_expected_arrivals)) {
-                    // Clean for next usages
-                    *wait_ptr = 0;
+                const auto signal = gin.gin.readSignal(signal_id, 64, cuda::memory_order_acquire);
+                if (signal >= target)
                     return true;
-                }
 
                 if (is_last_check) {
                     printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, scale-up: %d/%d, "
-                           "channel: %d, signal: %lld, expected: %d\n",
+                           "channel: %d, signal: %lu, target: %lu\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
-                           channel_idx, signal, num_expected_arrivals);
+                           channel_idx, signal, target);
                 }
                 return false;
             });
