@@ -9,7 +9,7 @@ namespace deep_ep::elastic::gin_alloc {
 
 // NCCL GIN EFA GDA: Resource limitation.
 static constexpr int kTotalQPBudget              = 256;
-static constexpr int kMaxGinContextBudget        = 17;
+static constexpr int kMaxGinContextBudget        = 18;
 
 // Minimum GIN context sharing factor.
 static constexpr int kMinGinContextSharingFactor = 10;
@@ -44,16 +44,32 @@ struct GinResourceConfig {
 //
 // Hardware ceiling: total indexed signals (gin_context_cnt × gin_indexed_signals_cnt)
 // must be >= max_scaleout_warps so every warp can own a dedicated signal id.
-// With the current budgets this caps max_scaleout_warps at 238
-// (17 contexts × 14 signals/ctx = 238).
+// With the current budgets this caps max_scaleout_warps at 216
+// (18 contexts × 12 signals/ctx = 216).
+//
+// return value between 2:kMaxGinContextBudget GIN context
 __forceinline__ __device__ __host__ constexpr GinResourceConfig compute_gin_resources(int max_scaleout_warps) {
 
     GinResourceConfig cfg{};
 
-    // return value between 2:kMaxGinContextBudget GIN context
-    const int by_sharing = math::constexpr_ceil_div(max_scaleout_warps, kMinGinContextSharingFactor);
-    const int capped = by_sharing < kMaxGinContextBudget ? by_sharing : kMaxGinContextBudget;
-    cfg.gin_context_cnt = capped > 2 ? capped : 2;
+    const int gin_context_cnt_unbounded = math::constexpr_ceil_div(max_scaleout_warps, kMinGinContextSharingFactor);
+    const int gin_context_cnt_bounded =
+        gin_context_cnt_unbounded < kMaxGinContextBudget ? gin_context_cnt_unbounded : kMaxGinContextBudget;
+
+    // NOTE: GIN contexts are pinned to rails via (gin_context_id % num_of_rails).
+    // To ensure traffic is evenly distributed across rails, the number of GIN
+    // contexts must be divisible by the number of rails. As an initial step,
+    // we enforce an EVEN count (rounding odd counts up by one) so that
+    // context-pair patterns line up correctly across rails.
+    //
+    // return value between 2:kMaxGinContextBudget GIN context; force EVEN
+    // (round odd counts up by one) so context-pair patterns line up.
+    const int gin_context_cnt_bounded_and_even =
+        (gin_context_cnt_bounded % 2 == 0)
+            ? gin_context_cnt_bounded
+            : ((gin_context_cnt_bounded + 1) < kMaxGinContextBudget ? (gin_context_cnt_bounded + 1)
+                                                                    : kMaxGinContextBudget);
+    cfg.gin_context_cnt = gin_context_cnt_bounded_and_even;
 
     // Internal EFA GDA implementation: Each gin context consume:
     //      >> Internal QP dedicated for the putValue.
