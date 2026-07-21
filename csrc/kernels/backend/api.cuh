@@ -77,6 +77,8 @@ public:
     int num_max_sms;
     elastic::gin_alloc::GinResourceConfig gin_config;
 
+    int num_channels_per_sm = 1;
+
     // Buffer size
     int64_t num_gpu_bytes;
     int64_t num_cpu_bytes;
@@ -86,7 +88,10 @@ public:
                                const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                const bool& allow_hybrid_mode,
                                const int& sl_idx, const int& num_allocated_qps,
-                               const int& num_max_sms);
+                               const int& num_max_sms,
+                               const int& dispatch_token_bytes, const int& combine_token_bytes,
+                               const int& notify_smem_bytes, const int& smem_budget_bytes,
+                               const bool& prefer_overlap_with_compute);
 
     // TODO: finish this with `explicit_destroy`
     // ~NCCLSymmetricMemoryContext();

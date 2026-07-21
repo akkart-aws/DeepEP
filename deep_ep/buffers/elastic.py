@@ -133,6 +133,7 @@ class ElasticBuffer:
                  num_max_tokens_per_rank: int = 0,
                  hidden: int = 0,
                  num_topk: int = 0,
+                 num_experts: int = 0,
                  use_fp8_dispatch: bool = False,
                  # Configs
                  deterministic: bool = False,
@@ -219,6 +220,7 @@ class ElasticBuffer:
                                         prefer_overlap_with_compute,
                                         sl_idx, num_allocated_qps,
                                         num_max_sms,
+                                        num_max_tokens_per_rank, hidden, num_topk, num_experts,
                                         num_cpu_timeout_secs, num_gpu_timeout_secs,
                                         self.explicitly_destroy)
 

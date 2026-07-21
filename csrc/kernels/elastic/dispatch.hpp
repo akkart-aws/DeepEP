@@ -5,6 +5,7 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/gin_resource_alloc.cuh>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
@@ -100,6 +101,7 @@ public:
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
+        int gin_indexed_signals_cnt;  // provisioned per-context signal budget, hybrid dispatch only
         int num_scaleout_ranks, num_scaleup_ranks;
         int num_hidden_bytes, num_sf_packs;
         int num_max_tokens_per_rank;
@@ -123,6 +125,7 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
+        int dispatch_iteration;
 
         jit::LaunchArgs launch_args;
     };
@@ -144,7 +147,7 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch";
-            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.allow_multiple_reduction,
@@ -154,7 +157,8 @@ public:
                 args.num_hidden_bytes, args.num_sf_packs,
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
-                args.num_qps, args.num_timeout_cycles);
+                args.num_qps, args.num_timeout_cycles,
+                args.gin_indexed_signals_cnt);
         }
 
         return fmt::format(R"(
@@ -200,7 +204,8 @@ static void __instantiate_kernel() {{
                 args.nccl_dev_comm, args.nccl_window,
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
-                args.scaleout_rank_idx, args.scaleup_rank_idx
+                args.scaleout_rank_idx, args.scaleup_rank_idx,
+                args.dispatch_iteration
             ));
         }
     }
@@ -237,6 +242,7 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                             const bool& is_scaleup_nvlink,
                             const int& num_sms, const int& num_channels_per_sm,
+                            const int& gin_indexed_signals_cnt,
                             const int& num_smem_bytes,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
@@ -245,6 +251,7 @@ static void launch_dispatch(void* x, void* sf,
                             // Combine-time reduction mode. Only affects the hybrid kernel's
                             // `token_map_at_dispatch` slot encoding; direct dispatch ignores it.
                             const bool& allow_multiple_reduction,
+                            const int& dispatch_iteration,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -292,6 +299,7 @@ static void launch_dispatch(void* x, void* sf,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
+        .gin_indexed_signals_cnt = gin_indexed_signals_cnt,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = hidden * elem_size, .num_sf_packs = num_sf_packs,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -311,6 +319,7 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .dispatch_iteration = dispatch_iteration,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);

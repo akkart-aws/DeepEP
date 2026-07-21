@@ -5,6 +5,7 @@
 #include <vector>
 #include <pybind11/functional.h>
 
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/compiled.cuh>
 
@@ -44,6 +45,8 @@ class ElasticBuffer {
 
     // Whether to allow multiple reductions
     bool allow_multiple_reduction;
+
+    mutable int dispatch_iteration = 0;
 
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
@@ -88,6 +91,8 @@ public:
                   const bool& prefer_overlap_with_compute,
                   const int& sl_idx, const int& num_allocated_qps,
                   const int& num_max_sms,
+                  const int& num_max_tokens_per_rank, const int& hidden,
+                  const int& num_topk, const int& num_experts,
                   const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                   const bool& explicitly_destroy):
         num_buffer_bytes(num_buffer_bytes),
@@ -112,10 +117,23 @@ public:
         // Symmetric memory layout: [[[Workspace] GPU buffer] CPU buffer]
         // sym.num_bytes = workspace + buffer, sym.num_cpu_bytes = CPU buffer
         const auto num_sym_bytes = num_workspace_bytes + num_buffer_bytes;
+        const bool is_moe_buffer = hidden > 0;
+        const int fp8_num_sf_packs = math::ceil_div(hidden, 32);
+        const int dispatch_token_bytes = is_moe_buffer
+            ? get_dispatch_token_layout(hidden, /*elem_size=*/1, fp8_num_sf_packs, num_topk).get_num_bytes<true>()
+            : 0;
+        const int combine_token_bytes = is_moe_buffer
+            ? get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk).get_num_bytes<true>()
+            : 0;
+        const int notify_smem_bytes = get_num_notify_smem_bytes(num_ranks, num_experts);
+        const int smem_budget_bytes = jit::device_runtime->get_num_smem_bytes();
+
         this->nccl_context = std::make_shared<nccl::NCCLSymmetricMemoryContext>(
             nccl_comm, cpu_comm, num_ranks, rank_idx,
             num_sym_bytes, num_cpu_buffer_bytes,
-            allow_hybrid_mode, sl_idx, num_allocated_qps, num_max_sms);
+            allow_hybrid_mode, sl_idx, num_allocated_qps, num_max_sms,
+            dispatch_token_bytes, combine_token_bytes, notify_smem_bytes, smem_budget_bytes,
+            prefer_overlap_with_compute);
 
         // Verify the symmetric memory layout matches our expectations
         EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes == nccl_context->num_gpu_bytes);
@@ -579,13 +597,17 @@ public:
             return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
         } else {
             // Hybrid dispatch
+            const auto scaleout_token_layout = layout::TokenLayout(
+                hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true,
+                nullptr, /*with_scaleout_hdr=*/true);
+            const int scaleout_slots =
+                num_max_tokens_per_rank + kNumMaxChannels * elastic::gin_alloc::kScaleoutSlotRoundingReserve;
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
             const auto scaleout_send_buffer = layout::BufferLayout<false>(
-                token_layout, 1, num_max_tokens_per_rank);
+                scaleout_token_layout, num_scaleout_ranks, scaleout_slots);
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
-                token_layout, num_scaleout_ranks,
-                /* kNumChannels * kNumMaxTokensPerChannel */ num_max_tokens_per_rank + kNumMaxChannels);
+                scaleout_token_layout, num_scaleout_ranks, scaleout_slots);
             return scaleup_recv_buffer.get_num_bytes() +
                    scaleout_send_buffer.get_num_bytes() +
                    scaleout_recv_buffer.get_num_bytes();
@@ -823,6 +845,12 @@ public:
                 /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            if (num_sms > 0 and nccl_context->num_channels_per_sm > 0) {
+                EP_HOST_ASSERT(num_channels_per_sm >= nccl_context->num_channels_per_sm and
+                               "actual token layout fits fewer channels than provisioned; "
+                               "buffer was constructed with a larger token than any dispatch uses");
+                num_channels_per_sm = nccl_context->num_channels_per_sm;
+            }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
@@ -978,6 +1006,8 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
+        ++ dispatch_iteration;
+
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -1000,10 +1030,12 @@ public:
                         nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                         nccl_context->is_scaleup_nvlink,
                         num_sms, num_channels_per_sm,
+                        nccl_context->gin_config.gin_indexed_signals_cnt,
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, deterministic, do_cpu_sync,
                         allow_multiple_reduction,
+                        dispatch_iteration,
                         comm_stream);
 
         // Received token counters
@@ -1364,7 +1396,7 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
-        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, bool, int, int, int, int, int, bool>())
+        .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, bool, int, int, int, int, int, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)

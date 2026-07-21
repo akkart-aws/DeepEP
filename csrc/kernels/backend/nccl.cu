@@ -64,7 +64,10 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
                                                        const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                                        const bool& allow_hybrid_mode,
                                                        const int& sl_idx, const int& num_allocated_qps,
-                                                       const int& num_max_sms):
+                                                       const int& num_max_sms,
+                                                       const int& dispatch_token_bytes, const int& combine_token_bytes,
+                                                       const int& notify_smem_bytes, const int& smem_budget_bytes,
+                                                       const bool& prefer_overlap_with_compute):
     rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps), num_max_sms(num_max_sms) {
     if (get_env("EP_BUFFER_DEBUG", 0)) {
         int nccl_version;
@@ -108,11 +111,45 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             this->num_max_sms = elastic::gin_alloc::kMaxSM;
         }
 
-        const int scaleout_warp_cap = (this->num_max_sms > 0)
-            ? (this->num_max_sms * elastic::gin_alloc::kMaxWarpsPerSM)
+        constexpr int kNumNotifyWarps = 4;
+        constexpr int kNumMaxChannelsPerSM = 8;
+        if (dispatch_token_bytes <= 0) {
+            const int scaleout_warp_cap = (this->num_max_sms > 0)
+                ? (this->num_max_sms * elastic::gin_alloc::kMaxWarpsPerSM)
+                : elastic::gin_alloc::kMaxScaleoutWarps;
+            gin_config = elastic::gin_alloc::compute_gin_resources(scaleout_warp_cap);
+            this->num_channels_per_sm = 0;
+        } else {
+            auto channels_per_sm_for_smem = [&]() -> int {
+                int cpsm = std::min(
+                    (smem_budget_bytes - notify_smem_bytes) / std::max(1, dispatch_token_bytes),
+                    32 - kNumNotifyWarps);
+                cpsm = std::min(cpsm, smem_budget_bytes / std::max(1, combine_token_bytes));
+                cpsm = std::min(cpsm / 2, kNumMaxChannelsPerSM);
+                if (not prefer_overlap_with_compute)
+                    cpsm = std::min(cpsm, elastic::gin_alloc::kMaxWarpsPerSM);
+                return std::max(1, cpsm);
+            };
+            const int smem_cpsm = channels_per_sm_for_smem();
 
-            : elastic::gin_alloc::kMaxScaleoutWarps;
-        gin_config = elastic::gin_alloc::compute_gin_resources(scaleout_warp_cap);
+            const int scaleout_warp_cap = (this->num_max_sms > 0)
+                ? (this->num_max_sms * elastic::gin_alloc::kMaxWarpsPerSM)
+                : elastic::gin_alloc::kMaxScaleoutWarps;
+            gin_config = elastic::gin_alloc::compute_gin_resources(scaleout_warp_cap);
+
+            const int num_available_qps_est = std::max(1,
+                (this->num_allocated_qps > 0 ? this->num_allocated_qps : gin_config.gin_context_cnt)
+                - (kNumNotifyWarps > 0 ? 1 : 0));
+            const int qps = std::min(num_available_qps_est, gin_config.gin_context_cnt);
+            const auto part_alloc = elastic::gin_alloc::compute_part_allocation(
+                gin_config, std::max(1, this->num_max_sms), std::max(1, qps), smem_cpsm);
+            this->num_channels_per_sm = part_alloc.num_channels_per_sm;
+        }
+
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("DeepEP GIN fixed point: channels_per_sm=%d, gin_context_cnt=%d, "
+                   "gin_indexed_signals_cnt=%d\n",
+                   this->num_channels_per_sm, gin_config.gin_context_cnt, gin_config.gin_indexed_signals_cnt);
 
         // Auto-tuner sanity checks, each peer rail team (not including self) must have dedicated signals
         EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1));
@@ -136,10 +173,14 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
                this->num_max_sms);
 
         reqs.ginExclusiveContexts = false;
-        reqs.ginQueueDepth = 1024;
+        // TODO: currently a WA, depth-1024 SQ rings across 17 contexts exceed the EFA DMA-pinning
+        // budget at comm create; these rings should live in card memory, not
+        // MR-mapped host memory. Revert to 1024 once the GDA-side fix lands.
+        reqs.ginQueueDepth = 256;
         reqs.ginTrafficClass = sl_idx;
         reqs.ginContextCount = gin_config.gin_context_cnt;
         reqs.ginSignalCount = gin_config.gin_indexed_signals_cnt;
+        reqs.ginCounterCount = gin_config.gin_indexed_signals_cnt;
 
         reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
         // VA signals are not supported by EFA GDA, in addition EFA GDA does not support strong signals.
