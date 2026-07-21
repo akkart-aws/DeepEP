@@ -112,6 +112,17 @@ __device__ __forceinline__ int get_qp_signal_id(
     }
 }
 
+// Per-part indexed-signal id: kNumParts contiguous ids under the channel's base id, one
+// per token part and shared by all sources. The tuner + channel cap guarantee
+// ceil(num_channels / qps) * kNumParts <= gin_indexed_signals_cnt.
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, int kNumParts,
+          bool kWithNotifyWarps = false>
+__device__ __forceinline__ int get_per_part_signal_id(
+    const int& sm_idx, const int& channel_in_sm_idx, const int& part_idx) {
+    return get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
+               sm_idx, channel_in_sm_idx) * kNumParts + part_idx;
+}
+
 template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
 __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     const handle::NCCLGin& gin,
@@ -195,16 +206,13 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
             gin.signal(team, i, ncclGin_SignalInc{sig});
         }
 
-        // TODO(NCCL): Using the official NCCL wait signal API, after they added timeout check.
         for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
             const auto signal_idx = static_cast<ncclGinSignal_t>(i);
             const auto shadow_ptr = gin.getSignalShadowPtr(signal_idx);
             const auto target = ++(*shadow_ptr);
 
-            const auto gdaki = static_cast<struct ncclGinGdakiGPUContext*>(gin._ginHandle) + gin.contextId;
-            const auto signal_ptr = reinterpret_cast<uint64_t*>(__ldg(reinterpret_cast<uint64_t*>(&gdaki->signals_table.buffer))) + signal_idx;
             timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = ptx::ld_acquire_sys<uint64_t>(signal_ptr);
+                const auto signal = gin.readSignal(signal_idx, 64, cuda::memory_order_acquire);
                 if (signal >= target)
                     return true;
 

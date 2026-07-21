@@ -170,11 +170,13 @@ struct NCCLGin {
     }
 
     template <typename team_t,
-              typename remote_action_t = ncclGin_None>
+              typename remote_action_t = ncclGin_None,
+              typename local_action_t = ncclGin_None>
     __device__ __forceinline__
     void put(void* recv_sym_ptr, void* send_sym_ptr, const int& num_bytes, const int& dst_rank_idx,
              const int& extra_options = 0,
-             const remote_action_t& remote_action = remote_action_t()) const {
+             const remote_action_t& remote_action = remote_action_t(),
+             const local_action_t& local_action = local_action_t()) const {
         // NOTES: local or NVLink put will also go through NIC via this API
         IS_TEAM_WORLD_RAIL({
             gin.put(TEAM_WORLD_RAIL(),
@@ -185,7 +187,7 @@ struct NCCLGin {
                     nccl_window, reinterpret_cast<int64_t>(send_sym_ptr) - lsa_base_ptr,
                     num_bytes,
                     remote_action,
-                    ncclGin_None(),
+                    local_action,
                     ncclCoopThread(),
                     ncclGin_None(),
                     cuda::thread_scope_thread,

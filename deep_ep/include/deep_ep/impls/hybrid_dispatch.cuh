@@ -3,6 +3,7 @@
 #include <deep_ep/common/comm.cuh>
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
@@ -10,6 +11,23 @@
 
 
 namespace deep_ep::elastic {
+
+static constexpr int64_t kScaleoutHeaderWrittenBit = static_cast<int64_t>(1) << 63;
+
+__device__ __forceinline__ int64_t pack_scaleout_header(const int& iteration, const int& count,
+                                                        const bool& more) {
+    return kScaleoutHeaderWrittenBit
+         | (static_cast<int64_t>(iteration & 0x7fffffff) << 32)
+         | (static_cast<int64_t>(count & 0x3fffffff) << 1)
+         | (more ? static_cast<int64_t>(1) : static_cast<int64_t>(0));
+}
+
+__device__ __forceinline__ bool unpack_scaleout_header(const int64_t& header, const int& iteration,
+                                                       int& count, bool& more) {
+    count = static_cast<int>((header >> 1) & 0x3fffffff);
+    more = (header & 0x1) != 0;
+    return header < 0 and ((header >> 32) & 0x7fffffff) == (iteration & 0x7fffffff);
+}
 
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
@@ -21,12 +39,16 @@ template <bool kDoCPUSync,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          int kNumGinSignals,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
+          int kNumParts = gin_alloc::constexpr_num_parts(
+              kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps),
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
-          int kScaleoutUpdateInterval = 3,
-          int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
+          int kPartSize = math::constexpr_ceil_div(kNumMaxTokensPerChannel, kNumParts),
+          int kBatchSize = kPartSize,
+          int kNumSlotsPerForwardChunk = 48,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumScaleoutSendThreads = kNumScaleoutWarps * 32,
@@ -48,12 +70,20 @@ hybrid_dispatch_impl(
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     void* buffer,
     void* workspace, void* mapped_host_workspace,
-    const int scaleout_rank_idx, const int scaleup_rank_idx) {
+    const int scaleout_rank_idx, const int scaleup_rank_idx,
+    const int dispatch_iteration) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
+    EP_STATIC_ASSERT(kNumParts <= layout::WorkspaceLayout::kNumMaxParts,
+                     "kNumParts exceeds the per-part header workspace capacity");
+    EP_STATIC_ASSERT(kNumParts >= 1, "Invalid part count");
+    EP_STATIC_ASSERT(gin_alloc::constexpr_channels_per_sm(
+                         kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps)
+                         == kNumScaleoutWarps,
+                     "GIN signal budget cannot host the launched channel count");
 
     // Utils
     // NOTES: a warp is a channel (different channels may share QPs)
@@ -80,23 +110,26 @@ hybrid_dispatch_impl(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Global parallel barriers for scale-out subteam and scale-up subteam
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, false, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
-
-    // The golden layout during the whole process for both scale-out and forward warps
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+    const auto scaleout_token_layout = layout::TokenLayout(
+        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
     const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumScaleoutWarps + kNumForwardWarps, 1,
             math::advance_ptr<int>(smem, kNumSmemBytesForNotify)).get_rank_buffer(warp_idx - kNumNotifyWarps).get_token_buffer(0);
 
-    // All the buffers
+    constexpr int kNumSlotsPerChannel = kNumParts * kBatchSize;
+    const auto phys_token_slot = [&](const int& logical) { return logical; };
+    const auto part_first_slot = [&](const int& part) { return part * kBatchSize; };
+
     auto scaleup_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
     auto scaleout_send_buffer = layout::BufferLayout<false>(
-        token_layout, 1, kNumMaxTokensPerRank, scaleup_buffer.get_buffer_end_ptr());
+        scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleup_buffer.get_buffer_end_ptr());
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
-        token_layout, kNumScaleoutRanks, kNumChannels * kNumMaxTokensPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
+        scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
+
+    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
+        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -327,16 +360,47 @@ hybrid_dispatch_impl(
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
         const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
+        const auto part_signal_id = [&](const int& part_idx) {
+            return static_cast<ncclGinSignal_t>(
+                comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
+                                             kNumParts, (kNumNotifyWarps > 0)>(
+                    sm_idx, scaleout_warp_idx, part_idx));
+        };
+        const auto stage_part_header = [&](layout::BufferLayout<false>& send_ch,
+                                           const int& part_idx, const int& count, const bool& more) {
+            auto* hdr = send_ch.get_token_buffer(part_first_slot(part_idx)).get_hdr_ptr();
+            *hdr = pack_scaleout_header(dispatch_iteration, count, more);
+            ptx::fence_acq_rel_sys();
+        };
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
-        scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
+        scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
 
         // Channel metadata maintenance
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
         int stored_scaleout_tail = 0, stored_old_scaleout_tail = 0;
         int stored_combine_slot_tail = 0;
+        int coalesce_flushed = 0;
+        const auto flush_part = [&](const int& up_to, const bool& is_final) {
+            if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
+                return;
+            const int part_idx = coalesce_flushed / kBatchSize;
+            const int count = up_to - coalesce_flushed;
+            auto send_ch = scaleout_send_buffer.get_rank_buffer(lane_idx)
+                               .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+            stage_part_header(send_ch, part_idx, count, /*more=*/not is_final);
+            const int num_put_tokens = count > 0 ? count : 1;
+            gin.put<ncclTeamTagRail>(
+                scaleout_recv_buffer.get_token_buffer(part_first_slot(part_idx)).get_base_ptr(),
+                send_ch.get_token_buffer(part_first_slot(part_idx)).get_base_ptr(),
+                scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
+                lane_idx, 0,
+                ncclGin_SignalAdd{part_signal_id(part_idx), 1ull},
+                ncclGin_WeakCounterInc{part_signal_id(part_idx)});
+            coalesce_flushed = up_to;
+        };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
-            if (lane_idx < kNumScaleoutRanks and
-                (stored_scaleout_tail >= stored_old_scaleout_tail + kScaleoutUpdateInterval or finish_flag)) {
+            if (lane_idx == scaleout_rank_idx and
+                (stored_scaleout_tail >= stored_old_scaleout_tail + kBatchSize or finish_flag)) {
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
                 const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
@@ -482,39 +546,34 @@ hybrid_dispatch_impl(
                 }
             }
 
-            // Wait TMA arrival and issue the TMA store into send buffer
             if (ptx::elect_one_sync()) {
                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
                 ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-
-                // So if no ranks will go by RDMA, we skip the send buffer stores
-                if (scaleout_rank_mask ^ (1 << scaleout_rank_idx)) {
-                    ptx::tma_store_1d(scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
-                                      tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
-                }
+            }
+            __syncwarp();
+            if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
+                auto send_ch = scaleout_send_buffer.get_rank_buffer(stored_dst_scaleout_rank_idx)
+                                   .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+                ptx::tma_store_1d(send_ch.get_token_buffer(phys_token_slot(stored_dst_slot_idx)).get_base_ptr(),
+                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             }
             __syncwarp();
 
             // Local rank can be bypassed
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
-                ptx::tma_store_1d(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+                ptx::tma_store_1d(scaleout_recv_buffer.get_token_buffer(phys_token_slot(stored_dst_slot_idx)).get_base_ptr(),
                                   tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             }
             ptx::tma_store_commit();
             ptx::tma_store_wait();
             __syncwarp();
 
-            // Preload the next token (overlapping with the IBGDA issues)
+            // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            // Issue IBGDA requests
-            if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
-                gin.put<ncclTeamTagRail>(
-                        scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                        scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
-                        tma_buffer.get_num_bytes<false>(),
-                        stored_dst_scaleout_rank_idx,
-                        ncclGinOptFlagsAggregateRequests);
+            if (stored_scaleout_tail >= coalesce_flushed + kBatchSize) {
+                const int flushing_part = coalesce_flushed / kBatchSize;
+                flush_part(stored_scaleout_tail, /*is_final=*/flushing_part == kNumParts - 1);
             }
             __syncwarp();
 
@@ -522,13 +581,40 @@ hybrid_dispatch_impl(
             update_scaleout_tail();
         }
 
+        if (stored_scaleout_tail > coalesce_flushed) {
+            flush_part(stored_scaleout_tail, /*is_final=*/true);
+        } else if (coalesce_flushed / kBatchSize < kNumParts) {
+            flush_part(coalesce_flushed, /*is_final=*/true);
+        }
+        __syncwarp();
+
         // Flush unflushed tails
         update_scaleout_tail(true);
+
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
-        scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
+        const bool has_src = (lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx);
+        const auto part_signal_id = [&](const int& part_idx) {
+            return static_cast<ncclGinSignal_t>(
+                comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
+                                             kNumParts, (kNumNotifyWarps > 0)>(
+                    sm_idx, forward_warp_idx, part_idx));
+        };
+        int64_t rx_part_base[kNumParts];
+        #pragma unroll
+        for (int p = 0; p < kNumParts; ++ p)
+            rx_part_base[p] = static_cast<int64_t>(*gin.gin.getSignalShadowPtr(part_signal_id(p)));
+        scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
         scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
+
+        const auto part_first_slot = [&](const int& part_idx) { return part_idx * kBatchSize; };
+        const auto phys_token_slot = [&](const int& logical) { return logical; };
+        const auto read_batch_header = [&](const int& src, const int& part_idx) -> int64_t {
+            return ptx::ld_acquire_sys<int64_t>(
+                scaleout_recv_buffer.get_rank_buffer(src)
+                    .get_token_buffer(part_first_slot(part_idx)).get_hdr_ptr());
+        };
 
         // Shape of `token_metadata_at_forward`: `[kNumChannels, kNumScaleoutRanks * kNumMaxTokensPerChannel + 1, kNumForwardMetadataDims]`
         constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
@@ -552,6 +638,7 @@ hybrid_dispatch_impl(
         int stored_finish_flag = lane_idx >= kNumScaleoutRanks;
         int stored_scaleout_tail_idx = 0;
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;
+        int stored_terminal_part = -1;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
@@ -578,11 +665,46 @@ hybrid_dispatch_impl(
                     return false;
                 }
 
-                // Read new signaled tails
-                if (lane_idx < kNumScaleoutRanks) {
+                const bool src_valid = lane_idx < kNumScaleoutRanks;
+                const bool is_local_src = (lane_idx == scaleout_rank_idx);
+                int intended_finish = 0, intended_tail = 0;
+                if (is_local_src) {
                     const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
                         workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx));
-                    math::unpack2<int, int64_t>(signaled_tail, stored_finish_flag, stored_scaleout_tail_idx);
+                    math::unpack2<int, int64_t>(signaled_tail, intended_finish, intended_tail);
+                }
+                const bool is_remote_src = src_valid and not is_local_src;
+                int incremental_tail = stored_scaleout_tail_idx;
+                bool prefix_alive = is_remote_src;
+                bool my_finished = false;
+                #pragma unroll
+                for (int k = 0; k < kNumParts; ++ k) {
+                    const int64_t landed =
+                        static_cast<int64_t>(gin.gin.readSignal(part_signal_id(k)))
+                        - rx_part_base[k];
+                    int my_count = 0;
+                    bool my_more = false;
+                    const bool my_valid = is_remote_src and
+                        unpack_scaleout_header(read_batch_header(lane_idx, k), dispatch_iteration, my_count, my_more);
+                    const int num_valid = __popc(ptx::gather(my_valid));
+                    const bool part_landed = landed >= static_cast<int64_t>(num_valid);
+                    const bool through_k = prefix_alive and my_valid and part_landed;
+                    if (through_k)
+                        incremental_tail = k * kBatchSize + my_count;
+                    if (through_k and not my_more) {
+                        my_finished = true;
+                        stored_terminal_part = k;
+                    }
+                    prefix_alive = through_k;
+                }
+                if (is_local_src) {
+                    stored_finish_flag       = intended_finish;
+                    stored_scaleout_tail_idx = intended_tail;
+                } else if (src_valid) {
+                    if (incremental_tail > stored_scaleout_tail_idx)
+                        stored_scaleout_tail_idx = incremental_tail;
+                    if (my_finished)
+                        stored_finish_flag = 1;
                 }
                 __syncwarp();
                 return false;
@@ -599,7 +721,7 @@ hybrid_dispatch_impl(
 
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
             for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
-                const auto token_buffer = recv_buffer.get_token_buffer(slot_idx);
+                const auto token_buffer = recv_buffer.get_token_buffer(phys_token_slot(slot_idx));
 
                 // Wait TMA arrival
                 ptx::tma_store_wait();
@@ -715,7 +837,27 @@ hybrid_dispatch_impl(
         }
         __syncwarp();
 
-        // Clean tails for next usages
+        EP_STATIC_ASSERT(kNumParts <= 32, "One lane drains one part");
+        #pragma unroll
+        for (int k = 0; k < kNumParts; ++ k) {
+            const int expected_k = __popc(ptx::gather(stored_terminal_part >= k));
+            if (lane_idx == k and expected_k > 0) {
+                comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                    const int64_t landed =
+                        static_cast<int64_t>(gin.gin.readSignal(part_signal_id(k))) - rx_part_base[k];
+                    if (landed >= static_cast<int64_t>(expected_k))
+                        return true;
+                    if (is_last_check)
+                        printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
+                               "channel: %d, part: %d, landed: %lld, expected: %d\n",
+                               channel_idx, k, (long long)landed, expected_k);
+                    return false;
+                });
+                gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));
+            }
+        }
+        __syncwarp();
+
         if (lane_idx < kNumScaleoutRanks)
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
         __syncwarp();
