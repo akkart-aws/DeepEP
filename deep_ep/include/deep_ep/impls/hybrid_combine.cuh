@@ -390,7 +390,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 recv_ptr, send_ptr,
                 batch_count[dst] * token_layout.get_num_bytes<false>(),
                 dst,
-                0, /*flags=0*/
+                ncclGinOptFlagsAggregateRequests, /*flags=AGG (repro)*/
                 ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
             );
             batch_count[dst] = 0;
