@@ -375,7 +375,11 @@ hybrid_combine_impl(nv_bfloat16* x,
         int batch_count[kNumScaleoutRanks] = {};
         int batch_start_slot[kNumScaleoutRanks];
 
-        const auto issue_batched_rdma = [&](const int& dst) {
+        // `aggregate` sets ncclGinOptFlagsAggregateRequests: the put defers its
+        // doorbell, rung only by a later non-aggregated put on the same QP. An
+        // aggregated run must end with a non-aggregated put or its tail WQEs are
+        // never rung. Mid-stream puts aggregate; a channel's last put does not.
+        const auto issue_batched_rdma = [&](const int& dst, const bool aggregate = true) {
             if (batch_count[dst] == 0)
                 return;
             const auto send_ptr = scaleout_send_buffer
@@ -390,30 +394,30 @@ hybrid_combine_impl(nv_bfloat16* x,
                 recv_ptr, send_ptr,
                 batch_count[dst] * token_layout.get_num_bytes<false>(),
                 dst,
-                0, /*flags=0*/
+                aggregate ? ncclGinOptFlagsAggregateRequests : 0,
                 ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
             );
             batch_count[dst] = 0;
         };
 
         // Update per Channel/ScaleOutRank batch metadata and GIN PUT when threshold met
-        const auto record_slot_and_maybe_flush = [&](const int& dst, const int& slot) {
+        const auto record_slot_and_maybe_flush = [&](const int& dst, const int& slot, const bool aggregate = true) {
             if (batch_count[dst] == 0)
                 batch_start_slot[dst] = slot;
             batch_count[dst] += 1;
             if (batch_count[dst] == kBatchSize)
-                issue_batched_rdma(dst);
+                issue_batched_rdma(dst, aggregate);
         };
 
         int last_src_scaleout_rank_idx = -1;
         int last_slot_written = -1;
-        const auto flush_last_tma_and_record_batch = [&]() {
+        const auto flush_last_tma_and_record_batch = [&](const bool aggregate = true) {
             if (last_src_scaleout_rank_idx >= 0 and ptx::elect_one_sync()) {
                 ptx::tma_store_wait();
 
                  // Issue only if not local rank
                 if (last_src_scaleout_rank_idx != scaleout_rank_idx)
-                    record_slot_and_maybe_flush(last_src_scaleout_rank_idx, last_slot_written);
+                    record_slot_and_maybe_flush(last_src_scaleout_rank_idx, last_slot_written, aggregate);
             }
             __syncwarp();
         };
@@ -602,15 +606,18 @@ hybrid_combine_impl(nv_bfloat16* x,
             }
         }
 
-        // Issue the last TMA and record operation for last RDMA
+        // Final recorded token: non-aggregated in case it completes a batch
+        // (earlier in-loop records keep the default aggregate=true).
         if constexpr (kAllowMultipleReduction)
-            flush_last_tma_and_record_batch();
+            flush_last_tma_and_record_batch(/*aggregate=*/false);
 
-        // Issue the last RDMA per channel/scaleout-warp
+        // Drain each scaleout rank's leftover tokens — the last put per QP.
+        // Non-aggregated so it rings the doorbell and drains the deferred batch;
+        // otherwise the tail WQEs never reach the NIC and the peer signal hangs.
         if (ptx::elect_one_sync()) {
             #pragma unroll
             for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
-                issue_batched_rdma(dst);
+                issue_batched_rdma(dst, /*aggregate=*/false);
         }
         __syncwarp();
 
