@@ -375,6 +375,19 @@ hybrid_combine_impl(nv_bfloat16* x,
         int batch_count[kNumScaleoutRanks] = {};
         int batch_start_slot[kNumScaleoutRanks];
 
+        // Does this channel's LAST issued put leave its WQEs deferred? True whenever
+        // the most recent `issue_batched_rdma` ran with aggregate=true and nothing
+        // non-aggregated followed from this channel. The hole this closes: a dst
+        // whose token count is an exact multiple of kBatchSize gets its final put
+        // issued IN-LOOP with the default aggregate=true; if the channel's last
+        // token(s) are local-bypass, the final flush records nothing, the drain
+        // sees batch_count==0 everywhere and early-returns -- so this channel never
+        // rings, and if its slots are the highest on the (8-channel-shared) QP, the
+        // deferred tail is NEVER rung: the peer waits forever on that put's signal.
+        // Same-lane consistency: mutated only under ptx::elect_one_sync(), exactly
+        // like `batch_count` above.
+        bool tail_deferred = false;
+
         // `aggregate` sets ncclGinOptFlagsAggregateRequests: the put defers its
         // doorbell, rung only by a later non-aggregated put on the same QP. An
         // aggregated run must end with a non-aggregated put or its tail WQEs are
@@ -398,6 +411,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
             );
             batch_count[dst] = 0;
+            tail_deferred = aggregate;
         };
 
         // Update per Channel/ScaleOutRank batch metadata and GIN PUT when threshold met
@@ -618,6 +632,30 @@ hybrid_combine_impl(nv_bfloat16* x,
             #pragma unroll
             for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
                 issue_batched_rdma(dst, /*aggregate=*/false);
+            // The drain above early-returns for every dst whose batch_count is 0, so
+            // a channel whose last real put was aggregated can fall through here
+            // without EVER ringing. Terminate with one 0-byte, non-aggregated put:
+            // nccl posts a real WQE writing 0 bytes into the peer's per-context
+            // scratch via the peer DATA endpoint, which binds no FI_REMOTE_WRITE --
+            // the peer observes NOTHING (no signal id is touched: dispatch's part
+            // signals legitimately use the whole per-context id budget, so there is
+            // no spare id to borrow). The WQE's only purpose is its doorbell
+            // rendezvous, which rings the SQ to its own chunk_next, covering every
+            // deferred slot below it on this channel's QP. Requires the matching
+            // nccl change ("a Put always posts at least one WQE"): before it, a
+            // 0-byte no-signal put was silently dropped by putImplMode as a no-op.
+            // The recv/send pointers only feed window-offset arithmetic and are
+            // never dereferenced for a 0-byte put.
+            if (tail_deferred) {
+                const int terminator_dst = (scaleout_rank_idx + 1) % kNumScaleoutRanks;
+                gin.put<ncclTeamTagRail>(
+                    scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx).get_token_buffer(0).get_base_ptr(),
+                    scaleout_send_buffer.get_rank_buffer(terminator_dst).get_token_buffer(0).get_base_ptr(),
+                    0, terminator_dst,
+                    0 /* non-aggregated: rings now */
+                );
+                tail_deferred = false;
+            }
         }
         __syncwarp();
 
