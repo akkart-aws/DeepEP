@@ -26,6 +26,7 @@
 #include <deep_ep/layout/bucket/workspace.cuh>
 
 #include "api.hpp"
+#include "../ep/kernel_select.hpp"
 #include "../../runtime/jit.hpp"
 #include "../../utils/system.hpp"
 
@@ -152,9 +153,10 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
         // Customized RDMA barrier needs extra signals
         reqs.ginSignalCount = num_ranks + 2 * 2;
 
-        // Only hybrid mode uses the shared-context weak-signal GIN configuration;
-        // direct mode keeps the upstream requirements untouched.
-        if (allow_hybrid_mode) {
+        // Only the unordered hybrid kernels use the shared-context weak-signal GIN
+        // configuration; direct mode and the ordered hybrid kernels keep the
+        // upstream requirements untouched.
+        if (allow_hybrid_mode and not ep::use_ordered_hybrid_kernel()) {
             const int num_rail_ranks = ncclTeamRail(comm).nRanks;
             const bool scaleout_active = num_rail_ranks > 1;
 
