@@ -47,6 +47,8 @@ public:
     ncclWindow_t window;
 
     int num_allocated_qps;
+    // Narrowed from V2's `GinResourceConfig`: the launcher only needs the signal count
+    int gin_indexed_signals_cnt = 0;
     int num_cpu_timeout_secs;
     int64_t num_gpu_timeout_cycles;
 
