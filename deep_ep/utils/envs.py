@@ -90,6 +90,27 @@ def init_dist(local_rank: int, num_local_ranks: int, seed: int = 0) -> Tuple[int
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
 
+    # One-process-per-GPU launch (EP_SLURM_ONE_PROC_PER_GPU=1).
+    #
+    # Default layout: slurm starts 1 task per NODE and torch.multiprocessing.spawn
+    # forks 8 workers, so `local_rank` is the spawn index and
+    # world_size = num_nodes * num_local_ranks.
+    #
+    # With this flag the launcher instead starts 8 slurm TASKS per node and
+    # test_ep.py spawns only 1 worker each, so `local_rank` is always 0 and
+    # cannot identify the GPU. Take the identity from slurm instead:
+    #   SLURM_LOCALID (0..7)  -> which GPU on this node
+    #   SLURM_NTASKS         -> total ranks across all nodes
+    #   SLURM_PROCID         -> the global rank
+    # This keeps one rank per GPU while removing the fork layer.
+    if os.getenv('EP_SLURM_ONE_PROC_PER_GPU', '0') == '1':
+        local_rank = int(os.getenv('SLURM_LOCALID', local_rank))
+        world_size = int(os.getenv('SLURM_NTASKS', num_nodes * num_local_ranks))
+        global_rank = int(os.getenv('SLURM_PROCID', 0))
+    else:
+        world_size = num_nodes * num_local_ranks
+        global_rank = node_rank * num_local_ranks + local_rank
+
     # Set local rank
     global _local_rank
     _local_rank = local_rank
@@ -98,8 +119,8 @@ def init_dist(local_rank: int, num_local_ranks: int, seed: int = 0) -> Tuple[int
     params = {
         'backend': 'nccl',
         'init_method': f'tcp://{ip}:{port}',
-        'world_size': num_nodes * num_local_ranks,
-        'rank': node_rank * num_local_ranks + local_rank,
+        'world_size': world_size,
+        'rank': global_rank,
     }
     if 'device_id' in sig.parameters:
         # noinspection PyTypeChecker
@@ -110,7 +131,7 @@ def init_dist(local_rank: int, num_local_ranks: int, seed: int = 0) -> Tuple[int
     torch.cuda.set_device(local_rank)
 
     init_seed(seed)
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
+    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(world_size)))
 
 
 def get_physical_domain_size(group: dist.ProcessGroup) -> Tuple[int, int]:
