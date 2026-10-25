@@ -44,3 +44,12 @@ target_link_libraries(_C PRIVATE nccl ${RUNTIME_CUDA_LIBRARIES} ${TORCH_LIBRARIE
 
 # Enable kernel code indexing with CMake-based IDEs
 cuda_add_library(deep_ep_indexing_cuda STATIC csrc/indexing/main.cu)
+
+# Host-only unit tests. `deep_ep/comm/qp_mapping.cuh` is deliberately free of CUDA and
+# NCCL types so the exact shipped channel<->QP arithmetic compiles as plain C++; these
+# need no CUDA, no Torch and no NCCL, so they are the one part of the suite that runs
+# anywhere. Run with `ctest`.
+enable_testing()
+add_executable(test_qp_mapping tests/cpp/test_qp_mapping.cpp)
+target_include_directories(test_qp_mapping PRIVATE deep_ep/include)
+add_test(NAME qp_mapping COMMAND test_qp_mapping)
