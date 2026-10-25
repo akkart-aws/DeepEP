@@ -36,10 +36,17 @@ inline void init_jit(const std::string& library_root_path, const std::string& nc
         nvcc_flags.emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
         nvcc_flags.emplace_back("-I" + nccl_include_dir.string());
         nvcc_flags.emplace_back("-DEP_NUM_TOPK_IDX_BITS=" + std::to_string(EP_NUM_TOPK_IDX_BITS));
+        // NOTES: upstream compiles only the GDAKI device backend into the JIT kernels, so on
+        // EFA the kernels cannot issue either EFA-GDA (type 5) or host-proxy (type 2)
+        // operations even when the host selects them. Enable both, since this fork targets
+        // EFA; compiling an unavailable backend only costs compile time, and the host side
+        // still decides which one is used. Set either to 0 to recover upstream's build.
         nvcc_flags.emplace_back("-DNCCL_GIN_GDAKI_ENABLE=1");
-        nvcc_flags.emplace_back("-DNCCL_GIN_PROXY_ENABLE=0");
+        nvcc_flags.emplace_back("-DNCCL_GIN_PROXY_ENABLE=" +
+                                std::to_string(get_env<int>("EP_GIN_PROXY_ENABLE", 1)));
         nvcc_flags.emplace_back("-DNCCL_GIN_GPI_ENABLE=0");
-        nvcc_flags.emplace_back("-DNCCL_GIN_EFA_GDA_ENABLE=0");
+        nvcc_flags.emplace_back("-DNCCL_GIN_EFA_GDA_ENABLE=" +
+                                std::to_string(get_env<int>("EP_GIN_EFA_GDA_ENABLE", 1)));
         if (get_env<int>("EP_GIN_GDAKI_DEBUG", 0))
             nvcc_flags.emplace_back("-DNCCL_DEVICE_GIN_GDAKI_ENABLE_DEBUG=1");
         return runtime;

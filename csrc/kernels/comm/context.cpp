@@ -141,12 +141,21 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
             (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
             "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
-        EP_HOST_ASSERT(
-            props.ginSupport[NCCL_GIN_TYPE_GDAKI] and
-            "NCCL GDAKI is unavailable for this communicator.");
-
         gin_min_stride = props.ginMinStride;
-        reqs.ginType = NCCL_GIN_TYPE_GDAKI;
+
+        // NOTES: upstream pins `reqs.ginType = NCCL_GIN_TYPE_GDAKI` unconditionally. NCCL
+        // consults `NCCL_GIN_TYPE` only when the caller leaves `reqs.ginType` at NONE
+        // (`gin_host.cc`: `reqGinType == NCCL_GIN_TYPE_NONE && envGinType > NONE`), so the
+        // pin silently disables the env override. On EFA that is fatal twice over: the
+        // communicator offers EFA-GDA (type 5) and the host proxy (type 2) but never GDAKI
+        // (type 3), so every backend gets skipped; and even where a plugin does advertise
+        // GDAKI, pinning it ignores an explicit `NCCL_GIN_TYPE=5`.
+        //
+        // So pin only when the user has expressed no preference AND the communicator really
+        // offers GDAKI. An explicit `NCCL_GIN_TYPE` always wins, which is NCCL's own
+        // contract. IB behaviour with no env set is unchanged.
+        if (std::getenv("NCCL_GIN_TYPE") == nullptr and props.ginSupport[NCCL_GIN_TYPE_GDAKI])
+            reqs.ginType = NCCL_GIN_TYPE_GDAKI;
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;
         reqs.ginQueueDepth = qp_depth > 0 ? qp_depth : kDefaultQPDepth;
